@@ -10,6 +10,22 @@ local UnitExists = UnitExists
 local string_find = string.find
 local string_upper = string.upper
 
+-- ClassicAPI capability flags (nil-safe; SuperWoW-only installs keep working).
+local UPApiHasUnitGUID = type(UnitGUID) == "function"
+local UPApiHasUnitSubName = type(UnitSubName) == "function"
+local UPApiHasCUnitAuras = type(C_UnitAuras) == "table"
+	and type(C_UnitAuras.GetAuraDataByIndex) == "function"
+local UPApiHasCSpellCast = type(C_Spell) == "table"
+	and type(C_Spell.UnitCastingInfo) == "function"
+
+function UPApiHasClassicAuras()
+	return UPApiHasCUnitAuras
+end
+
+function UPApiHasClassicCast()
+	return UPApiHasCSpellCast
+end
+
 function UPApiGetAdditionalAuraPollingDelaySeconds()
 	return 0.1
 
@@ -46,31 +62,36 @@ UPApiScanToolTextLine2 = _G["UPApiScanToolTextLeft2"] -- This is the line with <
 
 --PUBLIC
 function UPApiGetMyGUID()
+	if UPApiHasUnitGUID then
+		return UnitGUID("player")
+	end
 	local _, xguid = UnitExists("player")
 	return xguid
 end
 
-function UPApiGetGuildText(guid)
+function UPApiGetGuildText(unitOrGuid)
+	-- ClassicAPI: UnitSubName reads the creature title / subname without a
+	-- GameTooltip scan (the old hot-path cost on every full plate rebuild).
+	if UPApiHasUnitSubName then
+		local sub = UnitSubName(unitOrGuid)
+		if sub and sub ~= "" then
+			return sub
+		end
+	end
+
+	local guild = GetGuildInfo(unitOrGuid)
+	if guild and guild ~= "" then
+		return guild
+	end
+
 	UPApiScanTool:ClearLines()
-	UPApiScanTool:SetUnit(guid)
+	UPApiScanTool:SetUnit(unitOrGuid)
 	local scanTextLine2Text = UPApiScanToolTextLine2:GetText()
-	
-	local guild = nil
-	
-	if not string.find(scanTextLine2Text, "Level") then
-		--local owner, _ = string.split("'",ownerText)
-		guild = scanTextLine2Text
-		-- if guild then
-			-- print("guild: "..guild)
-		-- end
+	if scanTextLine2Text and not string.find(scanTextLine2Text, "Level") then
+		return scanTextLine2Text
 	end
-	
-	if not guild then
-		--then get guild from api
-		guild = GetGuildInfo(guid)
-	end
-	
-	return guild
+
+	return nil
 end
 
 --PUBLIC
@@ -186,8 +207,12 @@ function UPApiIsTarget(guid)
 	local now = GetTime()
 	if (now - UPApiTargetGuidCachedAt) > 0.1 then
 		UPApiTargetGuidCachedAt = now
-		local unitExists, unitExistsGuid = UnitExists("target")
-		UPApiTargetGuidCached = unitExistsGuid
+		if UPApiHasUnitGUID then
+			UPApiTargetGuidCached = UnitGUID("target")
+		else
+			local unitExists, unitExistsGuid = UnitExists("target")
+			UPApiTargetGuidCached = unitExists and unitExistsGuid or nil
+		end
 	end
 	return UPApiTargetGuidCached and (UPApiTargetGuidCached == guid)
 end
@@ -197,6 +222,12 @@ end
 function UPApiGetTargetGuid()
 	UPApiIsTarget(nil) -- refresh the cache if stale
 	return UPApiTargetGuidCached
+end
+
+-- Force-refresh the target GUID cache (call from PLAYER_TARGET_CHANGED).
+function UPApiSetCachedTargetGuid(guid)
+	UPApiTargetGuidCached = guid
+	UPApiTargetGuidCachedAt = GetTime()
 end
 
 -- The engine's "fade non-targeted nameplates" alpha is not exposed via API in
@@ -696,9 +727,113 @@ local function UPApiCacheInAuraIfValid(guid, auraName, isDebuff, isMyAura, caste
 
 end
 
---PUBLIC
-function UpApiGetUnitAuras(guid, getBuffs, onlyMineBuffs, getDebuffs, onlyMineDebuffs, ignoredBuffNames, ignoredDebuffNames)
-	--UPApiSyncAurasCacheWithActual(guid)
+-- ClassicAPI path: read auras + timings from C_UnitAuras instead of the
+-- combat-log duration cache. unitToken is a nameplateN / target / etc.
+local function UPApiCollectAurasViaClassicAPI(unitToken, getBuffs, onlyMineBuffs, getDebuffs, onlyMineDebuffs, ignoredBuffNames, ignoredDebuffNames)
+	local unitBuffs = {}
+	local unitDebuffs = {}
+	local myGuid = UPApiGetMyGUID()
+
+	local function appendFromFilter(filter, wantBuffs, wantDebuffs, onlyMine)
+		local i = 1
+		while i <= 40 do
+			local d = C_UnitAuras.GetAuraDataByIndex(unitToken, i, filter)
+			if not d or not d.name then
+				break
+			end
+
+			local isDebuff = d.isHarmful and true or false
+			if (wantBuffs and not isDebuff) or (wantDebuffs and isDebuff) then
+				local name = d.name
+				local nameIsIgnored = false
+				local ignoreList = isDebuff and ignoredDebuffNames or ignoredBuffNames
+				if ignoreList then
+					local upperName = string_upper(name)
+					for _, ignoredName in ipairs(ignoreList) do
+						if upperName == ignoredName then
+							nameIsIgnored = true
+							break
+						end
+					end
+				end
+
+				local isMyAura = (d.sourceGUID and myGuid and d.sourceGUID == myGuid) and true or false
+				if (not nameIsIgnored) and (not (onlyMine and (not isMyAura))) then
+					local duration = d.duration or 0
+					local expirationTime = d.expirationTime or 0
+					local startTime = 0
+					if duration > 0 and expirationTime > 0 then
+						startTime = expirationTime - duration
+					elseif duration == 0 then
+						duration = -1
+						expirationTime = -1
+						startTime = -1
+					end
+
+					local entry = {
+						spellId = d.spellId,
+						name = name,
+						texture = d.icon,
+						count = d.applications or 1,
+						debuffType = d.dispelName,
+						duration = duration,
+						startTime = startTime,
+						expirationTime = expirationTime,
+						isDebuff = isDebuff,
+						casterGuid = d.sourceGUID,
+					}
+					if isDebuff then
+						table.insert(unitDebuffs, entry)
+					else
+						table.insert(unitBuffs, entry)
+					end
+				end
+			end
+			i = i + 1
+		end
+	end
+
+	if getBuffs then
+		local filter = onlyMineBuffs and "HELPFUL|PLAYER" or "HELPFUL"
+		appendFromFilter(filter, true, false, onlyMineBuffs)
+	end
+	if getDebuffs then
+		local filter = onlyMineDebuffs and "HARMFUL|PLAYER" or "HARMFUL"
+		appendFromFilter(filter, false, true, onlyMineDebuffs)
+	end
+
+	table.sort(unitBuffs, function(a, b)
+		return a.expirationTime > b.expirationTime
+	end)
+	table.sort(unitDebuffs, function(a, b)
+		return a.expirationTime > b.expirationTime
+	end)
+
+	local allAuras = {}
+	for _, data in ipairs(unitBuffs) do
+		table.insert(allAuras, data)
+	end
+	for _, data in ipairs(unitDebuffs) do
+		table.insert(allAuras, data)
+	end
+	return allAuras
+end
+
+-- Optional 8th arg: unitToken ("nameplateN"). When ClassicAPI C_UnitAuras is
+-- available this skips the combat-log sync/cache path entirely.
+function UpApiGetUnitAuras(guid, getBuffs, onlyMineBuffs, getDebuffs, onlyMineDebuffs, ignoredBuffNames, ignoredDebuffNames, unitToken)
+	if unitToken and UPApiHasCUnitAuras and UnitExists(unitToken) then
+		return UPApiCollectAurasViaClassicAPI(
+			unitToken,
+			getBuffs,
+			onlyMineBuffs,
+			getDebuffs,
+			onlyMineDebuffs,
+			ignoredBuffNames,
+			ignoredDebuffNames
+		)
+	end
+
 	-- Queue at most one sync per guid at a time; every plate polls every 0.2s,
 	-- so without this the timer queue accumulates duplicate sync tasks.
 	if not guid or not UnitExists(guid) then
@@ -715,14 +850,9 @@ function UpApiGetUnitAuras(guid, getBuffs, onlyMineBuffs, getDebuffs, onlyMineDe
 		)
 	end
 
-	local maxAuras = 80 -- maybe it could be more than 16, whatever
 	local unitBuffs = {}
 	local unitDebuffs = {}
-	
-	if not guid or not UnitExists(guid) then
-		return nil
-	end
-	
+
 	local cache = UPApiGetGuidAurasCache(guid)
 	for cachedName, cachedData in pairs(cache) do
 		local spellId = cachedData.spellId
@@ -859,6 +989,52 @@ function UPApiUnitCastingInfo(guid)
 	isChannel = entry.isChannel
 	
 	return spellName, spellNameSecondary, spellDisplayName, spellIcon, spellStartTimeMillis, spellEndTimeMillis, spellIsTradeSkill, isChannel
+end
+
+-- Seed / clear the cast cache from ClassicAPI C_Spell (event-driven; not polled).
+function UPApiPollCastFromUnit(unitToken)
+	if not unitToken or not UPApiHasCSpellCast then
+		return nil
+	end
+	local guid = UPApiHasUnitGUID and UnitGUID(unitToken) or nil
+	if not guid then
+		return nil
+	end
+
+	local name, _, texture, startMs, endMs, _, _, noInterrupt = C_Spell.UnitCastingInfo(unitToken)
+	local isChannel = false
+	if not name then
+		name, _, texture, startMs, endMs, _, noInterrupt = C_Spell.UnitChannelInfo(unitToken)
+		isChannel = true
+	end
+	if not name or not startMs or not endMs then
+		local entry = UPApiGetCastEntry(guid)
+		entry.name = nil
+		entry.icon = nil
+		entry.startTime = 0
+		entry.endTime = 0
+		return nil
+	end
+
+	local entry = UPApiGetCastEntry(guid)
+	entry.name = name
+	entry.icon = texture
+	entry.startTime = startMs
+	entry.endTime = endMs
+	entry.interruptible = not noInterrupt
+	entry.isChannel = isChannel
+	return entry
+end
+
+function UPApiClearCastForGuid(guid)
+	if not guid then return end
+	local entry = UPApiCastCache[guid]
+	if entry then
+		entry.name = nil
+		entry.icon = nil
+		entry.startTime = 0
+		entry.endTime = 0
+	end
 end
 --CASTING END
 

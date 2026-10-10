@@ -3,7 +3,11 @@ Nameplates for twow/octowow/capycraft
 
 Continuation of https://github.com/Redbu11dev/ShaguPlates-extra (Complete rewrite based on kui nameplates, no more shaguplates dependencies, no kui dependencies either, no third party libraries, much better code, etc.)
 
-REQUIRES SUPERWOW https://github.com/balakethelock/SuperWoW (and preferably UnitXP-SP3 https://codeberg.org/konaka/UnitXP_SP3/releases) 
+## Requirements
+
+- **ClassicAPI** (recommended): event-driven nameplates via `C_NamePlate` / `NAME_PLATE_*`, plus `C_UnitAuras` and `C_Spell` for auras/casts — same approach as [brues-code/pfUI](https://github.com/brues-code/pfUI). Without it the addon falls back to WorldFrame scanning.
+- **SuperWoW** https://github.com/balakethelock/SuperWoW (still used for GUID helpers and as the no-ClassicAPI fallback)
+- Preferably **UnitXP-SP3** https://codeberg.org/konaka/UnitXP_SP3/releases 
 
 (!) If you are using ShaguTweaks - make sure to disable "Nameplate scale" in advanced settings (and any other napeplate setting that you may have) (!)
 

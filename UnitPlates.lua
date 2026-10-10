@@ -53,8 +53,31 @@ local function getClassPos(class)
 end
 
 local slowUpdateTime, critUpdateTime, aurasUnitUpdateTime = 0.1, 0.01, 0.2
+-- Fallback aura poll when UNIT_AURA is wired (event path is primary).
+local aurasUnitUpdateTimeEventDriven = 1.0
+
+-- Throttle profile inspired by pfUI ClassicAPI nameplates:
+-- target plates stay smooth; mass packs drop to a few FPS.
+local UP_THROTTLE_CENTRAL = 0.01   -- ~100 Hz central loop gate
+local UP_THROTTLE_TARGET = 0.02    -- ~50 Hz
+local UP_THROTTLE_NORMAL = 0.1     -- ~10 Hz
+local UP_THROTTLE_MASS = 0.2       -- ~5 Hz when many plates
+local UP_THROTTLE_CAST = 0.05      -- active castbar on non-target
+local UP_THROTTLE_MIN = 0.02
+local UP_SORT_INTERVAL = 0.05
+local UP_BUBBLE_INTERVAL = 0.1
+local UP_MASS_PLATE_THRESHOLD = 20
 
 local rightClickSimulationDelay = 0.15
+
+-- Event-driven plate registry (ClassicAPI NAME_PLATE_*). Fallback WorldFrame
+-- discovery still fills these when ClassicAPI is absent.
+local UPVisiblePlates = {}
+local UPVisiblePlateCount = 0
+local UPPlateByGuid = {}
+local UPHasClassicNamePlates = type(C_NamePlate) == "table"
+	and type(C_NamePlate.GetNamePlateForUnit) == "function"
+local UPHasUnitGUID = type(UnitGUID) == "function"
 
 --SIZES
 --make all sizes relative to UPConstants.nameplateHealthBarHeight
@@ -313,12 +336,21 @@ local function ResetFrame(kuiPlateFrame, originalPlateFrame)
 	kuiPlateFrame.glow2:Hide()
 	-- kuiPlateFrame.visglow:Hide()
 	-- kuiPlateFrame.visglow2:Hide()
-	originalPlateFrame.totem:Hide()
+	if originalPlateFrame.totem then
+		originalPlateFrame.totem:Hide()
+	end
 	kuiPlateFrame.isTarget = nil
 	UPCoreFrameFadeRemoveFrame(kuiPlateFrame.castWarning)
 	kuiPlateFrame.castWarning:Hide()
 	HideAllAuras(kuiPlateFrame)
 	kuiPlateFrame.guid = nil
+	kuiPlateFrame.cachedGuid = nil
+	kuiPlateFrame.unit = nil
+	kuiPlateFrame.eventcache = nil
+	kuiPlateFrame.auraUpdate = nil
+	kuiPlateFrame.castUpdate = nil
+	kuiPlateFrame.lasttick = nil
+	kuiPlateFrame.lastFullTick = nil
 	-- isBoss is only ever set (never cleared) when the skull region is visible;
 	-- reset it here so a recycled plate doesn't inherit it from a previous unit
 	kuiPlateFrame.isBoss = false
@@ -326,6 +358,77 @@ local function ResetFrame(kuiPlateFrame, originalPlateFrame)
 	kuiPlateFrame.lastFullGuid = nil
 	kuiPlateFrame.lastFullName = nil
 	kuiPlateFrame.lastFullLevel = nil
+end
+
+local function UPRegisterPlateUnitEvents(kuiPlateFrame, unit)
+	if not kuiPlateFrame or not unit then return end
+	if kuiPlateFrame.RegisterUnitEvent then
+		kuiPlateFrame:RegisterUnitEvent("UNIT_AURA", unit)
+		kuiPlateFrame:RegisterUnitEvent("UNIT_FLAGS", unit)
+		if UPApiHasClassicCast and UPApiHasClassicCast() then
+			kuiPlateFrame:RegisterUnitEvent("UNIT_SPELLCAST_START", unit)
+			kuiPlateFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START", unit)
+			kuiPlateFrame:RegisterUnitEvent("UNIT_SPELLCAST_STOP", unit)
+			kuiPlateFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_STOP", unit)
+		end
+	end
+end
+
+local function UPUnregisterPlateUnitEvents(kuiPlateFrame)
+	if not kuiPlateFrame then return end
+	if kuiPlateFrame.UnregisterAllEvents then
+		kuiPlateFrame:UnregisterAllEvents()
+	end
+end
+
+local function UPBindPlateUnit(originalPlateFrame, unit)
+	local kuiPlateFrame = originalPlateFrame.kui
+	if not kuiPlateFrame then return end
+
+	kuiPlateFrame.unit = unit
+	local guid = nil
+	if unit and UPHasUnitGUID then
+		guid = UnitGUID(unit)
+	end
+	if not guid and originalPlateFrame.GetName then
+		guid = originalPlateFrame:GetName(1)
+	end
+	kuiPlateFrame.cachedGuid = guid
+	kuiPlateFrame.guid = guid
+
+	if guid then
+		UPPlateByGuid[guid] = originalPlateFrame
+	end
+
+	UPRegisterPlateUnitEvents(kuiPlateFrame, unit)
+
+	-- Unit may already be mid-cast when the plate appears.
+	if unit and UPApiHasClassicCast and UPApiHasClassicCast() then
+		if UPApiPollCastFromUnit(unit) then
+			kuiPlateFrame.castUpdate = true
+		end
+	end
+
+	kuiPlateFrame.auraUpdate = true
+	kuiPlateFrame.eventcache = true
+	kuiPlateFrame.doFullUpdate = true
+end
+
+local function UPUnbindPlateUnit(originalPlateFrame)
+	local kuiPlateFrame = originalPlateFrame and originalPlateFrame.kui
+	if not kuiPlateFrame then return end
+
+	local guid = kuiPlateFrame.cachedGuid
+	if guid and UPPlateByGuid[guid] == originalPlateFrame then
+		UPPlateByGuid[guid] = nil
+	end
+	if guid then
+		UPApiClearCastForGuid(guid)
+	end
+	UPUnregisterPlateUnitEvents(kuiPlateFrame)
+	kuiPlateFrame.unit = nil
+	kuiPlateFrame.cachedGuid = nil
+	kuiPlateFrame.guid = nil
 end
 
 local function OnFrameShow(originalPlateFrame)
@@ -344,8 +447,31 @@ local function UpdatePlate(kuiPlateFrame)
 	local doFullUpdate = kuiPlateFrame.doFullUpdate
 	kuiPlateFrame.doFullUpdate = false
 
-	-- guid is needed by every fast-path block; keep it current per tick.
-	kuiPlateFrame.guid = kuiPlateFrame.originalPlateFrame:GetName(1)
+	-- Prefer the GUID cached on NAME_PLATE_UNIT_ADDED (or last resolve).
+	-- Falling back to SuperWoW GetName(1) only when the cache is empty avoids
+	-- a per-tick C call on every visible plate.
+	if kuiPlateFrame.cachedGuid then
+		kuiPlateFrame.guid = kuiPlateFrame.cachedGuid
+	elseif kuiPlateFrame.unit and UPHasUnitGUID then
+		kuiPlateFrame.guid = UnitGUID(kuiPlateFrame.unit)
+		kuiPlateFrame.cachedGuid = kuiPlateFrame.guid
+	else
+		kuiPlateFrame.guid = kuiPlateFrame.originalPlateFrame:GetName(1)
+		kuiPlateFrame.cachedGuid = kuiPlateFrame.guid
+	end
+
+	-- Prefer the stable nameplateN token for Unit* reads when ClassicAPI bound it.
+	local unitRef = kuiPlateFrame.unit or kuiPlateFrame.guid
+	if not unitRef then
+		return
+	end
+
+	-- Player-side state is shared across full + fast paths (party colors, pet
+	-- happiness). Hoist so locals stay in scope for the whole UpdatePlate call.
+	local playerState = UPGetCachedPlayerState()
+	local myGuildName = playerState.myGuildName
+	local myPlayerHasPetUI = playerState.myPlayerHasPetUI
+	local myPlayerPetIsHunterPet = playerState.myPlayerPetIsHunterPet
 
 	-- The engine recycles nameplate frames between units while they stay
 	-- visible. If the guid changed since the last full rebuild, force one now
@@ -398,27 +524,19 @@ local function UpdatePlate(kuiPlateFrame)
 		end
 		--raid icon end
 
-		--own player state (guild/pet/party): identical for every plate, cached for
-		--a second instead of being fetched per plate per tick.
-		local playerState = UPGetCachedPlayerState()
-		local myGuildName = playerState.myGuildName
-		local myPlayerHasPetUI = playerState.myPlayerHasPetUI
-		local myPlayerPetIsHunterPet = playerState.myPlayerPetIsHunterPet
-		--own player end
-
 		if kuiPlateFrame.originalPlateFrame.bossIconRegion and kuiPlateFrame.originalPlateFrame.bossIconRegion:IsVisible() then
 			-- This unit is a Boss (it has the skull icon active)
 			kuiPlateFrame.originalPlateFrame.bossIconRegion:SetTexture(nil)
 			kuiPlateFrame.isBoss = true
 		end
 
-		kuiPlateFrame.nameTextVariable = UnitName(kuiPlateFrame.guid)
+		kuiPlateFrame.nameTextVariable = UnitName(unitRef)
 
 		kuiPlateFrame.originalPlateFrame.isTotem = UPApiIsTotem(kuiPlateFrame.nameTextVariable)
 
-		kuiPlateFrame.guildTextVariable = UPApiGetGuildText(kuiPlateFrame.guid)
-		kuiPlateFrame.levelNumber = UnitLevel(kuiPlateFrame.guid)
-		kuiPlateFrame.isPlayer = UnitIsPlayer(kuiPlateFrame.guid)
+		kuiPlateFrame.guildTextVariable = UPApiGetGuildText(unitRef)
+		kuiPlateFrame.levelNumber = UnitLevel(unitRef)
+		kuiPlateFrame.isPlayer = UnitIsPlayer(unitRef)
 		-- remember the identity this static rebuild was based on (see the
 		-- frame-recycling guard at the top of UpdatePlate). These markers are
 		-- only written when the reads actually succeeded, so a transient nil
@@ -432,19 +550,19 @@ local function UpdatePlate(kuiPlateFrame)
 			local titleName = ""
 			kuiPlateFrame.titleName = titleName
 
-			local playerrankname, playerrank = GetPVPRankInfo(UnitPVPRank(kuiPlateFrame.guid), kuiPlateFrame.guid)
+			local playerrankname, playerrank = GetPVPRankInfo(UnitPVPRank(unitRef), unitRef)
 			kuiPlateFrame.pvpRank = playerrank
 		else
 			kuiPlateFrame.pvpRank = 0
 			kuiPlateFrame.titleName = ""
 		end
-		kuiPlateFrame.class, kuiPlateFrame.race, kuiPlateFrame.gender = UPApiGetClassRaceGender(kuiPlateFrame.guid)
-		kuiPlateFrame.classification = UnitClassification(kuiPlateFrame.guid)
-		kuiPlateFrame.isPlusMob = UnitIsPlusMob(kuiPlateFrame.guid)
-		kuiPlateFrame.creatureType = UPApiGetCreatureType(kuiPlateFrame.guid)
+		kuiPlateFrame.class, kuiPlateFrame.race, kuiPlateFrame.gender = UPApiGetClassRaceGender(unitRef)
+		kuiPlateFrame.classification = UnitClassification(unitRef)
+		kuiPlateFrame.isPlusMob = UnitIsPlusMob(unitRef)
+		kuiPlateFrame.creatureType = UPApiGetCreatureType(unitRef)
 		kuiPlateFrame.levelDifficultyColor = UPApiGetLevelDifficultyColor(kuiPlateFrame.levelNumber)
 		kuiPlateFrame.isGrayLevel = UPApiIsGrayLevel(kuiPlateFrame.levelNumber)
-		kuiPlateFrame.isPet = UPApiIsPet(kuiPlateFrame.guid)
+		kuiPlateFrame.isPet = UPApiIsPet(unitRef)
 		if kuiPlateFrame.isPet and kuiPlateFrame.guildTextVariable ~= "" then
 			kuiPlateFrame.isMyPet = false
 			if string_find(kuiPlateFrame.guildTextVariable, playerState.playerName.."'s Pet") then
@@ -464,17 +582,17 @@ local function UpdatePlate(kuiPlateFrame)
 	end
 
 	-- fast-path state, refreshed every tick ------------------------------
-	kuiPlateFrame.isInCombat = UnitAffectingCombat(kuiPlateFrame.guid)
-	kuiPlateFrame.unitMaxPower = UnitManaMax(kuiPlateFrame.guid)
+	kuiPlateFrame.isInCombat = UnitAffectingCombat(unitRef)
+	kuiPlateFrame.unitMaxPower = UnitManaMax(unitRef)
 	if kuiPlateFrame.unitMaxPower > 0 then
-		kuiPlateFrame.unitPower = UnitMana(kuiPlateFrame.guid)
-		kuiPlateFrame.unitPowerType = UnitPowerType(kuiPlateFrame.guid)
+		kuiPlateFrame.unitPower = UnitMana(unitRef)
+		kuiPlateFrame.unitPowerType = UnitPowerType(unitRef)
 	else
 		kuiPlateFrame.unitPower = 0
 		kuiPlateFrame.unitPowerType = 0
 	end
 	kuiPlateFrame.isTarget = UPApiIsTarget(kuiPlateFrame.guid)
-	kuiPlateFrame.isTapped = (UnitIsTapped(kuiPlateFrame.guid) and not (UnitIsTappedByPlayer(kuiPlateFrame.guid)))
+	kuiPlateFrame.isTapped = (UnitIsTapped(unitRef) and not (UnitIsTappedByPlayer(unitRef)))
 
 	--hide plate early to avoid calculations (every tick: on the full tick the
 	--fresh static data decides, and on fast ticks we must keep re-hiding so the
@@ -969,7 +1087,7 @@ local function UpdatePlate(kuiPlateFrame)
 	-- needed (UnitName on a valid guid is one API call).
 	local liveIsTotem = false
 	if kuiPlateFrame.guid then
-		local liveName = UnitName(kuiPlateFrame.guid)
+		local liveName = UnitName(unitRef)
 		if liveName then
 			liveIsTotem = UPApiIsTotem(liveName)
 		end
@@ -1143,7 +1261,7 @@ local function UpdatePlate(kuiPlateFrame)
 		-- kuiPlateFrame.threat:Hide()
 	-- end
 	
-	if (not kuiPlateFrame.isPlayer) and kuiPlateFrame.isInCombat and (not UnitIsFriend("player", kuiPlateFrame.guid)) and UPApiIsUnitTargetingMe(kuiPlateFrame.guid) then
+	if (not kuiPlateFrame.isPlayer) and kuiPlateFrame.isInCombat and (not UnitIsFriend("player", unitRef)) and UPApiIsUnitTargetingMe(kuiPlateFrame.guid) then
 		kuiPlateFrame.name:SetTextColor(0.9,0,0,1)
 		kuiPlateFrame.guild:SetTextColor(0.9,0,0,1)
 		kuiPlateFrame.health:SetStatusBarColor(0.85,0,0,1)
@@ -1156,7 +1274,7 @@ local function UpdatePlate(kuiPlateFrame)
 	
 	--PARTY/RAID
 	if kuiPlateFrame.isPlayer then
-		if UnitInParty(kuiPlateFrame.guid) then
+		if UnitInParty(unitRef) then
 		--if true then
 			--is in party
 			kuiPlateFrame.name:SetTextColor(0.4, 0.6, 1, 0.99999779462814)
@@ -1167,7 +1285,7 @@ local function UpdatePlate(kuiPlateFrame)
 			--kuiPlateFrame.health:SetStatusBarTexture("Interface\\AddOns\\UnitPlates\\img\\statusbar\\XPerl_StatusBar8")
 			
 			--UPApiIsPartyLeader(guid)
-		elseif UnitInRaid(kuiPlateFrame.guid) then
+		elseif UnitInRaid(unitRef) then
 		--elseif true then
 			--not in party but in raid
 			--0.85, 0.55, 0.25 --another option
@@ -1189,9 +1307,16 @@ local function UpdatePlate(kuiPlateFrame)
 		--add faction icon
 	--PVP SITUATION END
 	
-	--AURA POLLING
-	if kuiPlateFrame.aurasUpdateElapsed <= 0 then
-		kuiPlateFrame.aurasUpdateElapsed = aurasUnitUpdateTime
+	--AURA POLLING (event-driven via UNIT_AURA when ClassicAPI is present;
+	-- aurasUpdateElapsed is only a slow safety net / SuperWoW fallback).
+	local pollAuras = kuiPlateFrame.auraUpdate or (kuiPlateFrame.aurasUpdateElapsed <= 0)
+	if pollAuras then
+		kuiPlateFrame.auraUpdate = nil
+		if kuiPlateFrame.unit and UPApiHasClassicAuras and UPApiHasClassicAuras() then
+			kuiPlateFrame.aurasUpdateElapsed = aurasUnitUpdateTimeEventDriven
+		else
+			kuiPlateFrame.aurasUpdateElapsed = aurasUnitUpdateTime
+		end
 
 		-- ignore-lists are re-parsed only when the setting text changes
 		local ignoredBuffNames, ignoredDebuffNames = UPGetIgnoredAuraNames()
@@ -1203,41 +1328,23 @@ local function UpdatePlate(kuiPlateFrame)
 			UnitPlatesSettings.showDebuffs,
 			UnitPlatesSettings.onlyYourDebuffs,
 			ignoredBuffNames,
-			ignoredDebuffNames
+			ignoredDebuffNames,
+			kuiPlateFrame.unit
 		)
 		if polledUnitAuras then
 			kuiPlateFrame.unitAuras = polledUnitAuras
-		else
-			--we don't know if it's the same nameplate?
-			--kuiPlateFrame.unitAuras = {}
 		end
 	end
 	--AURA POLLING END
 end
 
-local clickUpdateTime = 0.01
-
--- stuff that needs to be updated every frame
-local function OnFrameUpdate(originalPlateFrame, e)
-	local kuiPlateFrame = originalPlateFrame.kui
-	kuiPlateFrame.elapsed = kuiPlateFrame.elapsed - e
-	kuiPlateFrame.critElap = kuiPlateFrame.critElap - e
-	kuiPlateFrame.aurasUpdateElapsed = kuiPlateFrame.aurasUpdateElapsed - e
-	kuiPlateFrame.clickElapsed = kuiPlateFrame.clickElapsed - e
-	
-	------------------------------------------------------------------- Alpha --
-	--IMPORTANT - DISABLES NON_TARGETED PLATE TRANSPARENCY
+local function UPApplyPlateAlpha(kuiPlateFrame, state)
 	-- The engine fades the original plate for non-targets and that alpha
-	-- propagates to this child frame; force it back to full alpha every frame
-	-- so plates never go transparent. When the "Keep original nameplate alpha"
-	-- config option is enabled we instead re-apply the original behavior
-	-- ourselves every frame (the engine misses recycled/returning plates, which
-	-- would otherwise keep whatever alpha they had before).
+	-- propagates to this child frame; force it back to full alpha so plates
+	-- never go transparent unless the config option re-enables it.
 	if UnitPlatesSettings.keepOriginalNameplateAlpha then
-		local plateGuid = kuiPlateFrame.originalPlateFrame:GetName(1)
-		-- no target at all -> everything full alpha; with a target, the target
-		-- is full alpha and everything else uses the engine's non-target fade
-		if not UPApiGetTargetGuid() or UPApiIsTarget(plateGuid) then
+		local plateGuid = kuiPlateFrame.cachedGuid or kuiPlateFrame.guid
+		if not state.targetGuid or (plateGuid and plateGuid == state.targetGuid) then
 			kuiPlateFrame:SetAlpha(1)
 		else
 			kuiPlateFrame:SetAlpha(UPApiGetNonTargetAlpha())
@@ -1245,23 +1352,93 @@ local function OnFrameUpdate(originalPlateFrame, e)
 	else
 		kuiPlateFrame:SetAlpha(1)
 	end
-	
-	------------------------------------------------------------------ Fading --
-	-- call delayed updates
-	
-	if kuiPlateFrame.critElap <= 0 then
-		kuiPlateFrame.critElap = critUpdateTime
-		
-		UpdatePlate(kuiPlateFrame)
-	end	
-	
-	if kuiPlateFrame.elapsed <= 0 then
-		kuiPlateFrame.elapsed = slowUpdateTime
+end
 
-		-- trigger the full static rebuild on the next UpdatePlate call
+local function UPProcessPlateMouse(originalPlateFrame, kuiPlateFrame)
+	local unitExists, unitExistsGuid = UnitExists("mouseover")
+	if unitExists and unitExistsGuid and (unitExistsGuid == kuiPlateFrame.guid) then
+		originalPlateFrame.isMouseover3dModel = true
+		originalPlateFrame.isInMouseOver = true
+	else
+		originalPlateFrame.isMouseover3dModel = false
+	end
+
+	if (not IsMouselooking()) and (MouseIsOver(kuiPlateFrame.health) or MouseIsOver(kuiPlateFrame.typeIcon) or MouseIsOver(kuiPlateFrame.power) or MouseIsOver(originalPlateFrame.totem)) then
+		originalPlateFrame.isInMouseOver = true
+		if kuiPlateFrame.guid and UnitCanAttack("player", kuiPlateFrame.guid) then
+			SetCursor("ATTACK_CURSOR")
+		end
+		if kuiPlateFrame.isTarget and UnitCanAttack("player", "target") then
+			SetCursor("ATTACK_CURSOR")
+		end
+	else
+		if not originalPlateFrame.isMouseover3dModel then
+			originalPlateFrame.isInMouseOver = false
+		end
+	end
+
+	if (GetTime() - originalPlateFrame.rightClickStartTime <= rightClickSimulationDelay)
+		and (not IsMouselooking())
+		and (MouseIsOver(kuiPlateFrame.health) or MouseIsOver(kuiPlateFrame.typeIcon) or MouseIsOver(kuiPlateFrame.power) or MouseIsOver(originalPlateFrame.totem)) then
+		originalPlateFrame:Click("RightButton")
+	end
+end
+
+-- Central per-plate updater (pfUI-style): cheap work every central tick,
+-- expensive UpdatePlate only past the category throttle (or on event flags).
+local function ProcessVisiblePlate(originalPlateFrame, state)
+	local kuiPlateFrame = originalPlateFrame.kui
+	if not kuiPlateFrame then return end
+
+	local elapsed = state.elapsed or UP_THROTTLE_CENTRAL
+	kuiPlateFrame.aurasUpdateElapsed = (kuiPlateFrame.aurasUpdateElapsed or 0) - elapsed
+
+	UPApplyPlateAlpha(kuiPlateFrame, state)
+	UPProcessPlateMouse(originalPlateFrame, kuiPlateFrame)
+
+	local now = state.now
+	-- Keep ProcessVisiblePlate throttle classification aligned with the
+	-- PLAYER_TARGET_CHANGED-maintained cache (also feeds UPApiIsTarget).
+	local isTarget = state.targetGuid and kuiPlateFrame.cachedGuid
+		and (state.targetGuid == kuiPlateFrame.cachedGuid)
+	local casting = kuiPlateFrame.castWarning and kuiPlateFrame.castWarning:IsShown()
+	local hasEvent = kuiPlateFrame.eventcache or kuiPlateFrame.auraUpdate
+		or kuiPlateFrame.castUpdate or kuiPlateFrame.doFullUpdate
+
+	-- Cheap gate using the floor throttle before classifying further.
+	if not hasEvent and (kuiPlateFrame.lasttick or 0) + UP_THROTTLE_MIN > now then
+		return
+	end
+
+	local throttle = UP_THROTTLE_NORMAL
+	if isTarget then
+		throttle = UP_THROTTLE_TARGET
+	elseif state.visibleCount > UP_MASS_PLATE_THRESHOLD then
+		throttle = UP_THROTTLE_MASS
+	end
+	if casting and not isTarget and UP_THROTTLE_CAST < throttle then
+		throttle = UP_THROTTLE_CAST
+	end
+
+	if not hasEvent and (kuiPlateFrame.lasttick or 0) + throttle > now then
+		return
+	end
+	kuiPlateFrame.lasttick = now
+	kuiPlateFrame.eventcache = nil
+	kuiPlateFrame.castUpdate = nil
+
+	-- Periodic full rebuild for mostly-static content (guild/icons/colors).
+	local ranFull = kuiPlateFrame.doFullUpdate
+	if (kuiPlateFrame.lastFullTick or 0) + slowUpdateTime <= now then
+		ranFull = true
 		kuiPlateFrame.doFullUpdate = true
+		kuiPlateFrame.lastFullTick = now
+	end
 
-		--pfquest compatibility
+	UpdatePlate(kuiPlateFrame)
+
+	-- pfquest icon refresh rides the full-rebuild cadence.
+	if ranFull then
 		if not kuiPlateFrame.isPlayer then
 			local icon = UPCompatPfQuestQuestObjectives[kuiPlateFrame.nameTextVariable]
 			if icon then
@@ -1273,96 +1450,6 @@ local function OnFrameUpdate(originalPlateFrame, e)
 		else
 			kuiPlateFrame.questIcon:Hide()
 		end
-		--
-	end
-	
-	-- kuiPlateFrame.health:EnableMouse(false)
-	
-	-- if kuiPlateFrame.clickElapsed <= 0 then
-		-- kuiPlateFrame.clickElapsed = clickUpdateTime
-		
-		-- if (not IsMouselooking() and MouseIsOver(kuiPlateFrame.health)) then
-			-- kuiPlateFrame.health:EnableMouse(true)
-			-- kuiPlateFrame.health:SetScript("OnMouseUp", function()
-				-- --print("here1")
-				-- if (not IsMouselooking()) and MouseIsOver(kuiPlateFrame.health) then
-					-- --print("here")
-					-- originalPlateFrame:Click(arg1)
-				-- end
-			-- end)
-			-- kuiPlateFrame.health:SetScript("OnMouseDown", function()
-				-- --print("here1")
-				-- if (not IsMouselooking()) and MouseIsOver(kuiPlateFrame.health) then
-					-- --print("here")
-					-- originalPlateFrame:Click(arg1)
-				-- end
-			-- end)
-		-- end
-	-- end
-	
-	-- kuiPlateFrame.originalPlateFrame:SetScript("OnMouseUp", function()
-		-- --print("here1")
-		-- if MouseIsOver(kuiPlateFrame.originalPlateFrame) then
-			-- --print("here")
-			-- originalPlateFrame:Click(arg1)
-		-- end
-	-- end)
-	
-	
-	
-	local unitExists, unitExistsGuid = UnitExists("mouseover")	
-	if unitExists and unitExistsGuid and (unitExistsGuid == kuiPlateFrame.guid) then
-		kuiPlateFrame.originalPlateFrame.isMouseover3dModel = true
-		kuiPlateFrame.originalPlateFrame.isInMouseOver = true
-		-- SetMouseoverUnit(unitExistsGuid)
-	else
-		kuiPlateFrame.originalPlateFrame.isMouseover3dModel = false
-		-- SetMouseoverUnit()
-	end	
-	
-	-- if not kuiPlateFrame.originalPlateFrame.isInMouseOver == false and kuiPlateFrame.originalPlateFrame.isMouseover3dModel == false then
-		-- SetMouseoverUnit()
-	-- end
-	
-	-- SetMouseoverUnit()
-	if (not IsMouselooking()) and (MouseIsOver(kuiPlateFrame.health) or MouseIsOver(kuiPlateFrame.typeIcon) or MouseIsOver(kuiPlateFrame.power) or MouseIsOver(originalPlateFrame.totem)) then
-		-- UnitPlatesMouselookCatcher:Show()
-	
-		kuiPlateFrame.originalPlateFrame.isInMouseOver = true
-		--print("MouseIsOver")
-		--SetMouseoverUnit(kuiPlateFrame.guid)
-		if kuiPlateFrame.guid and UnitCanAttack("player", kuiPlateFrame.guid) then
-			--print("can attack")
-			SetCursor("ATTACK_CURSOR")
-			--set right click attack action?
-		end
-		if (kuiPlateFrame.isTarget) and UnitCanAttack("player", "target") then
-			--print("can attack")
-			SetCursor("ATTACK_CURSOR")
-			--set right click attack action?
-		end
-		
-		-- GameTooltip_SetDefaultAnchor(GameTooltip, UIParent)
-		-- GameTooltip:SetUnit(kuiPlateFrame.guid)
-		-- GameTooltip:Show()		
-	else
-		-- --SetMouseoverUnit()
-		if not kuiPlateFrame.originalPlateFrame.isMouseover3dModel then
-			kuiPlateFrame.originalPlateFrame.isInMouseOver = false
-		end
-		
-		-- UnitPlatesMouselookCatcher:Hide()
-	end
-	
-	-- CustomNameplatesUpdateClickHandler(kuiPlateFrame.health, kuiPlateFrame.originalPlateFrame)
-	
-	--if less than 0.5 passed and NOT mouse is looking and mouse is over (and also did not leave the frame?)
-	--then execute click
-	
-	if (GetTime() - kuiPlateFrame.originalPlateFrame.rightClickStartTime <= rightClickSimulationDelay) 
-		and (not IsMouselooking()) 
-		and (MouseIsOver(kuiPlateFrame.health) or MouseIsOver(kuiPlateFrame.typeIcon) or MouseIsOver(kuiPlateFrame.power) or MouseIsOver(originalPlateFrame.totem)) then
-		originalPlateFrame:Click("RightButton")
 	end
 end
 
@@ -2675,36 +2762,58 @@ local function InitFrame(originalPlateFrame)
 	--auras END
 
 	----------------------------------------------------------------- Scripts --
-	-- originalPlateFrame:HookScript("OnShow", OnFrameShow)
-	-- originalPlateFrame:HookScript("OnHide", OnFrameHide)
-	-- originalPlateFrame:HookScript("OnUpdate", OnFrameUpdate)
-	
+	-- Plate content updates run from the central throttled loop over
+	-- UPVisiblePlates (pfUI-style). Per-plate OnUpdate is disabled.
+
 	-- Manual Hook for OnShow
 	local oldOnShow = originalPlateFrame:GetScript("OnShow")
 	originalPlateFrame:SetScript("OnShow", function()
-		if oldOnShow then oldOnShow() end		
-		OnFrameShow(this) -- In 1.12 we use 'this' instead of passing 'originalPlateFrame'
+		if oldOnShow then oldOnShow() end
+		OnFrameShow(this)
+		-- SuperWoW-only fallback: ClassicAPI ADDED owns visibility + unit bind.
+		if not UPHasClassicNamePlates then
+			if not UPVisiblePlates[this] then
+				UPVisiblePlates[this] = this
+				UPVisiblePlateCount = UPVisiblePlateCount + 1
+			end
+			-- Re-bind after ResetFrame so recycled/shown plates keep a GUID.
+			UPBindPlateUnit(this, nil)
+		end
 	end)
 
 	-- Manual Hook for OnHide
 	local oldOnHide = originalPlateFrame:GetScript("OnHide")
 	originalPlateFrame:SetScript("OnHide", function()
 		if oldOnHide then oldOnHide() end
-		--OnFrameHide(this)
-		--local kuiPlateFrame = self.kui
+		if UPVisiblePlates[this] then
+			UPVisiblePlates[this] = nil
+			UPVisiblePlateCount = UPVisiblePlateCount > 0 and (UPVisiblePlateCount - 1) or 0
+			UPUnbindPlateUnit(this)
+		end
 		this:Hide()
 		ResetFrame(this.kui, this)
 	end)
 
-	-- Manual Hook for OnUpdate
-	local oldOnUpdate = originalPlateFrame:GetScript("OnUpdate")
-	originalPlateFrame:SetScript("OnUpdate", function()
-		-- originalPlateFrame:SetWidth(1)
-		-- originalPlateFrame:SetHeight(1)
-		if oldOnUpdate then oldOnUpdate(arg1) end
-		OnFrameUpdate(this, arg1)
-		-- originalPlateFrame:SetWidth(1)
-		-- originalPlateFrame:SetHeight(1)
+	-- Disable Blizzard/per-plate OnUpdate; central loop owns updates.
+	originalPlateFrame:SetScript("OnUpdate", nil)
+
+	-- Per-plate unit events (ClassicAPI RegisterUnitEvent). `this` is the
+	-- kui overlay which receives only events for its bound nameplateN token.
+	kuiPlateFrame:SetScript("OnEvent", function()
+		if event == "UNIT_AURA" then
+			this.auraUpdate = true
+		elseif event == "UNIT_FLAGS" then
+			this.eventcache = true
+		elseif event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_CHANNEL_START" then
+			if this.unit and UPApiPollCastFromUnit(this.unit) then
+				this.castUpdate = true
+			end
+		elseif event == "UNIT_SPELLCAST_STOP" or event == "UNIT_SPELLCAST_CHANNEL_STOP" then
+			if this.cachedGuid then
+				UPApiClearCastForGuid(this.cachedGuid)
+				this.castUpdate = true
+			end
+		end
 	end)
 
 	kuiPlateFrame.oldHealth.kuiParent = originalPlateFrame
@@ -2842,8 +2951,16 @@ local function InitFrame(originalPlateFrame)
 	------------------------------------------------------------
 
 	if originalPlateFrame:IsShown() then
-		-- force OnShow
 		OnFrameShow(originalPlateFrame)
+		-- SuperWoW discovery may InitFrame an already-visible plate without a
+		-- fresh OnShow; register it. ClassicAPI waits for NAME_PLATE_UNIT_ADDED.
+		if not UPHasClassicNamePlates then
+			if not UPVisiblePlates[originalPlateFrame] then
+				UPVisiblePlates[originalPlateFrame] = originalPlateFrame
+				UPVisiblePlateCount = UPVisiblePlateCount + 1
+			end
+			UPBindPlateUnit(originalPlateFrame, nil)
+		end
 	else
 		kuiPlateFrame:Hide()
 	end
@@ -2921,54 +3038,123 @@ local UnitPlatesMainFrame = CreateFrame("Frame", "UnitPlatesMainFrame", UIParent
 UnitPlatesMainFrame:SetFrameStrata("LOW")
 UnitPlatesMainFrame.TimeToCheck = 0
 UnitPlatesMainFrame.numFrames = 0
+UnitPlatesMainFrame.frameTick = 0
+UnitPlatesMainFrame.sortElapsed = 0
+UnitPlatesMainFrame.bubbleElapsed = 0
+UnitPlatesMainFrame.eventcache = nil
+UnitPlatesMainFrame.frameState = {
+	now = 0,
+	elapsed = 0,
+	targetGuid = nil,
+	visibleCount = 0,
+}
 
 UnitPlatesMainFrame:SetScript("OnEvent", function()
-	--print("here11111111")
 	UnitPlatesAddonIsLoaded = true
 
 	if event == "ADDON_LOADED" and arg1 == "UnitPlates" then
 		UnitPlatesAddonIsLoaded = true
-		--print("----------ADDON_LOADED: "..tostring(arg1))
 		UnitPlatesMainFrame:UnregisterEvent("ADDON_LOADED")
-		
-		if (UnitPlatesAddonIsLoaded and UnitPlatesPlayerEnteredWorld) then
-			--UnitPlatesMainFrame:UnregisterEvent("PLAYER_ENTERING_WORLD")
-			--CoolHealthBar_OnLoad()
+
+		if UnitPlatesAddonIsLoaded and UnitPlatesPlayerEnteredWorld then
 			UPConfigInitUnitPlatesSettings()
 			InitUPConstants()
 		end
-	end
-	if event == "PLAYER_ENTERING_WORLD" then
+		if UPHasClassicNamePlates then
+			DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99UnitPlates|r: ClassicAPI nameplates enabled (event-driven)")
+		else
+			DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99UnitPlates|r: ClassicAPI not found - using SuperWoW WorldFrame scan fallback")
+		end
+	elseif event == "PLAYER_ENTERING_WORLD" then
 		UnitPlatesPlayerEnteredWorld = true
-		--print("----------ADDON_LOADED: "..tostring(arg1))
 		UnitPlatesMainFrame:UnregisterEvent("PLAYER_ENTERING_WORLD")
-		
-		if (UnitPlatesAddonIsLoaded and UnitPlatesPlayerEnteredWorld) then
-			--UnitPlatesMainFrame:UnregisterEvent("ADDON_LOADED")
-			--CoolHealthBar_OnLoad()
+
+		if UnitPlatesAddonIsLoaded and UnitPlatesPlayerEnteredWorld then
 			UPConfigInitUnitPlatesSettings()
 			InitUPConstants()
 			OnPlayerEnteringWorld()
 		end
+		local targetGuid = UPHasUnitGUID and UnitGUID("target") or nil
+		if not UPHasUnitGUID then
+			local exists, g = UnitExists("target")
+			if exists then targetGuid = g end
+		end
+		UPApiSetCachedTargetGuid(targetGuid)
+		UnitPlatesMainFrame.frameState.targetGuid = targetGuid
+	elseif event == "NAME_PLATE_CREATED" then
+		-- arg1 = the nameplate Frame; build overlay once per pool slot
+		local plate = arg1
+		if plate and not plate.kui then
+			InitFrame(plate)
+		end
+	elseif event == "NAME_PLATE_UNIT_ADDED" then
+		-- arg1 = "nameplateN"
+		local plate = C_NamePlate.GetNamePlateForUnit(arg1)
+		if plate then
+			if not plate.kui then
+				InitFrame(plate)
+			end
+			if not UPVisiblePlates[plate] then
+				UPVisiblePlates[plate] = plate
+				UPVisiblePlateCount = UPVisiblePlateCount + 1
+			end
+			OnFrameShow(plate)
+			UPBindPlateUnit(plate, arg1)
+			if plate.kui then
+				plate.kui:Show()
+			end
+		end
+	elseif event == "NAME_PLATE_UNIT_REMOVED" then
+		local plate = C_NamePlate.GetNamePlateForUnit(arg1)
+		if plate and UPVisiblePlates[plate] then
+			UPVisiblePlates[plate] = nil
+			UPVisiblePlateCount = UPVisiblePlateCount > 0 and (UPVisiblePlateCount - 1) or 0
+			UPUnbindPlateUnit(plate)
+			if plate.kui then
+				ResetFrame(plate.kui, plate)
+				plate.kui:Hide()
+			end
+		end
+	elseif event == "PLAYER_TARGET_CHANGED" then
+		local targetGuid = nil
+		if UPHasUnitGUID then
+			targetGuid = UnitGUID("target")
+		else
+			local exists, g = UnitExists("target")
+			if exists then targetGuid = g end
+		end
+		-- Force the API cache in sync so UpdatePlate's UPApiIsTarget is instant.
+		UPApiSetCachedTargetGuid(targetGuid)
+		UnitPlatesMainFrame.frameState.targetGuid = targetGuid
+		UnitPlatesMainFrame.eventcache = true
+		if UPHasClassicNamePlates then
+			local plate = C_NamePlate.GetNamePlateForUnit("target")
+			if plate and plate.kui then
+				plate.kui.eventcache = true
+				plate.kui.doFullUpdate = true
+			end
+		end
+	elseif event == "UPDATE_MOUSEOVER_UNIT" then
+		UnitPlatesMainFrame.eventcache = true
+	elseif event == "PLAYER_FOCUS_CHANGED"
+		or event == "PARTY_MEMBERS_CHANGED"
+		or event == "RAID_ROSTER_UPDATE" then
+		UnitPlatesMainFrame.eventcache = true
 	end
-	
-	-- if event == "UPDATE_MOUSEOVER_UNIT" then
-		-- print("event: "..tostring(event))
-		-- print("event: "..tostring(arg1))
-		-- print("event: "..tostring(arg2))
-		-- print("event: "..tostring(arg3))
-		-- print("event: "..tostring(arg4))
-	-- end
 end)
 
 UnitPlatesMainFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 UnitPlatesMainFrame:RegisterEvent("ADDON_LOADED")
-
 UnitPlatesMainFrame:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
 UnitPlatesMainFrame:RegisterEvent("PLAYER_TARGET_CHANGED")
 UnitPlatesMainFrame:RegisterEvent("PLAYER_FOCUS_CHANGED")
 UnitPlatesMainFrame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 UnitPlatesMainFrame:RegisterEvent("RAID_ROSTER_UPDATE")
+if UPHasClassicNamePlates then
+	UnitPlatesMainFrame:RegisterEvent("NAME_PLATE_CREATED")
+	UnitPlatesMainFrame:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+	UnitPlatesMainFrame:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
+end
 --event processing end
 
 
@@ -3081,111 +3267,154 @@ local function UPApplyFrameLevelStack(activePlates, activeCount)
 end
 
 UnitPlatesMainFrame:SetScript("OnUpdate", function()
-
-	if (UnitPlatesAddonIsLoaded) and (UnitPlatesPlayerEnteredWorld) then
+	if UnitPlatesAddonIsLoaded and UnitPlatesPlayerEnteredWorld then
 		UnitPlatesElapsedTimeSinceFullyLoaded = UnitPlatesElapsedTimeSinceFullyLoaded + arg1
 	end
 
-	if (UnitPlatesAddonIsLoaded) and (UnitPlatesPlayerEnteredWorld) and (UnitPlatesElapsedTimeSinceFullyLoaded > UnitPlatesLoadDelay) and UnitPlatesConstantsInitialized then
+	if not (UnitPlatesAddonIsLoaded and UnitPlatesPlayerEnteredWorld
+		and (UnitPlatesElapsedTimeSinceFullyLoaded > UnitPlatesLoadDelay)
+		and UnitPlatesConstantsInitialized) then
+		return
+	end
 
-		local self = UnitPlatesMainFrame
-		local elapsed = arg1
-		self.TimeToCheck = self.TimeToCheck - elapsed
-		if self.TimeToCheck > 0 then
-			return
+	local self = UnitPlatesMainFrame
+	local elapsed = arg1
+	local now = GetTime()
+
+	-- Central loop ~100 Hz (pfUI). Saves work at high client FPS.
+	if (self.frameTick or 0) + UP_THROTTLE_CENTRAL > now then
+		return
+	end
+	local tickElapsed = now - (self.frameTick or now)
+	if tickElapsed <= 0 then tickElapsed = UP_THROTTLE_CENTRAL end
+	self.frameTick = now
+
+	local state = self.frameState
+	state.now = now
+	state.elapsed = tickElapsed
+	state.visibleCount = UPVisiblePlateCount
+
+	-- Propagate global event flags to every visible plate.
+	if self.eventcache then
+		self.eventcache = nil
+		for plate in pairs(UPVisiblePlates) do
+			if plate.kui then
+				plate.kui.eventcache = true
+			end
 		end
-		-- 50ms is plenty for plate discovery and z-ordering; plate content has
-		-- its own per-plate updaters.
-		self.TimeToCheck = 0.05
+	end
 
-		local framesCount = WorldFrame:GetNumChildren()
-		local childrenChanged = framesCount ~= self.numFrames
-
-		-- find new nameplates and gather the visible ones for z-ordering.
-		-- The frames table is reused across ticks to avoid allocating a
-		-- WorldFrame-sized table every 50ms in crowded areas.
-		local frames = self.framesCache or {}
-		self.framesCache = frames
-		local activePlates = self.activePlatesCache or {}
-		self.activePlatesCache = activePlates
-		local activeCount = 0
-
-		if childrenChanged then
-			frames = {WorldFrame:GetChildren()}
+	-- SuperWoW-only discovery: scan WorldFrame when ClassicAPI is absent.
+	if not UPHasClassicNamePlates then
+		self.TimeToCheck = (self.TimeToCheck or 0) - tickElapsed
+		if self.TimeToCheck <= 0 then
+			self.TimeToCheck = UP_SORT_INTERVAL
+			local framesCount = WorldFrame:GetNumChildren()
+			local childrenChanged = framesCount ~= self.numFrames
+			local frames = self.framesCache or {}
 			self.framesCache = frames
-			self.numFrames = framesCount
-		end
-
-		for i = 1, framesCount do
-			local f = frames[i]
-			if childrenChanged and UPCoreIsNameplate(f) and not f.kui then
-				InitFrame(f)
+			if childrenChanged then
+				frames = {WorldFrame:GetChildren()}
+				self.framesCache = frames
+				self.numFrames = framesCount
 			end
-			if f.kui and f:IsShown() then
-				activeCount = activeCount + 1
-				activePlates[activeCount] = f
+			for i = 1, framesCount do
+				local f = frames[i]
+				if childrenChanged and UPCoreIsNameplate(f) and not f.kui then
+					InitFrame(f)
+				end
 			end
 		end
-		-- clear stale entries beyond the current count
-		for i = activeCount + 1, table_getn(activePlates) do
-			activePlates[i] = nil
-		end
+	end
 
-		-- update chat bubbles. Must run every tick, not only on childrenChanged:
-		-- the engine RECYCLES balloon frames for new messages (children count
-		-- does not change), so a change-gated scan keeps showing the previous
-		-- message/author. UPCoreStyleBalloon is cheap on re-entry: frame
-		-- creation is behind f.skinned and the text copy early-returns when
-		-- the text is unchanged.
-		if UnitPlatesSettings and UnitPlatesSettings.enableChatBubbleHandling then
+	-- Update visible plates (event registry, or SuperWoW OnShow registry).
+	for plate in pairs(UPVisiblePlates) do
+		if plate:IsShown() and plate.kui then
+			ProcessVisiblePlate(plate, state)
+		end
+	end
+
+	-- Chat bubbles still live as WorldFrame children (not nameplates).
+	self.bubbleElapsed = (self.bubbleElapsed or 0) - tickElapsed
+	if UnitPlatesSettings and UnitPlatesSettings.enableChatBubbleHandling
+		and self.bubbleElapsed <= 0 then
+		self.bubbleElapsed = UP_BUBBLE_INTERVAL
+		local framesCount = WorldFrame:GetNumChildren()
+		if framesCount ~= self.bubbleNumFrames then
+			self.bubbleFramesCache = {WorldFrame:GetChildren()}
+			self.bubbleNumFrames = framesCount
+		end
+		local frames = self.bubbleFramesCache
+		if frames then
 			for i = 1, framesCount do
 				local v = frames[i]
-				if UPCoreIsBalloon(v) then
+				if v and UPCoreIsBalloon(v) then
 					UPCoreStyleBalloon(v)
 				end
 			end
 		end
+	end
 
-		-- FRAME LEVEL SORTING: sort by screen Y (highest Y = background), then
-		-- apply the level stack only when the resulting order changed.
+	-- FRAME LEVEL SORTING (throttled): sort by screen Y, apply only on change.
+	self.sortElapsed = (self.sortElapsed or 0) - tickElapsed
+	if self.sortElapsed > 0 then
+		return
+	end
+	self.sortElapsed = UP_SORT_INTERVAL
+
+	local activePlates = self.activePlatesCache or {}
+	self.activePlatesCache = activePlates
+	local activeCount = 0
+	for plate in pairs(UPVisiblePlates) do
+		if plate.kui and plate:IsShown() then
+			activeCount = activeCount + 1
+			activePlates[activeCount] = plate
+			-- isTarget on the engine plate is used by the stack priority.
+			plate.isTarget = plate.kui.isTarget
+		end
+	end
+	for i = activeCount + 1, table_getn(activePlates) do
+		activePlates[i] = nil
+	end
+
+	self.sortYCache = self.sortYCache or {}
+	for i = 1, activeCount do
+		local f = activePlates[i]
+		local _, y = f:GetCenter()
+		self.sortYCache[f] = y or 0
+	end
+	table_sort(activePlates, function(a, b)
+		return UnitPlatesMainFrame.sortYCache[a] > UnitPlatesMainFrame.sortYCache[b]
+	end)
+
+	local stackChanged = (activeCount ~= self.lastActiveCount)
+	if not stackChanged then
 		for i = 1, activeCount do
 			local f = activePlates[i]
-			local _, y = f:GetCenter()
-			self.sortYCache = self.sortYCache or {}
-			self.sortYCache[f] = y or 0
+			if self.lastSortOrder[i] ~= f
+				or f.isTarget ~= self.lastSortTarget[f]
+				or f.kui.isMyPet ~= self.lastSortPet[f] then
+				stackChanged = true
+				break
+			end
 		end
-		table_sort(activePlates, function(a, b)
-			return UnitPlatesMainFrame.sortYCache[a] > UnitPlatesMainFrame.sortYCache[b]
-		end)
+	end
 
-		-- change detection: order, target or pet status of any plate
-		local stackChanged = childrenChanged or (activeCount ~= self.lastActiveCount)
-		if not stackChanged then
-			for i = 1, activeCount do
-				local f = activePlates[i]
-				if self.lastSortOrder[i] ~= f or f.isTarget ~= self.lastSortTarget[f] or f.kui.isMyPet ~= self.lastSortPet[f] then
-					stackChanged = true
-					break
-				end
-			end
+	if stackChanged then
+		self.lastSortOrder = self.lastSortOrder or {}
+		self.lastSortTarget = self.lastSortTarget or {}
+		self.lastSortPet = self.lastSortPet or {}
+		for i = 1, activeCount do
+			local f = activePlates[i]
+			self.lastSortOrder[i] = f
+			self.lastSortTarget[f] = f.isTarget
+			self.lastSortPet[f] = f.kui.isMyPet
 		end
-
-		if stackChanged then
-			self.lastSortOrder = self.lastSortOrder or {}
-			self.lastSortTarget = self.lastSortTarget or {}
-			self.lastSortPet = self.lastSortPet or {}
-			for i = 1, activeCount do
-				local f = activePlates[i]
-				self.lastSortOrder[i] = f
-				self.lastSortTarget[f] = f.isTarget
-				self.lastSortPet[f] = f.kui.isMyPet
-			end
-			for i = activeCount + 1, table_getn(self.lastSortOrder) do
-				self.lastSortOrder[i] = nil
-			end
-			self.lastActiveCount = activeCount
-			UPApplyFrameLevelStack(activePlates, activeCount)
+		for i = activeCount + 1, table_getn(self.lastSortOrder) do
+			self.lastSortOrder[i] = nil
 		end
+		self.lastActiveCount = activeCount
+		UPApplyFrameLevelStack(activePlates, activeCount)
 	end
 end)
 --MAIN LOOP END
